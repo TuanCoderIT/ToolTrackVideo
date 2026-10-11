@@ -2,6 +2,12 @@
 """
 GreenSM Vehicle Detection Pipeline - Stage 1 & Stage 2 CLI Tool
 
+Standardized Naming Convention:
+- Format: greensm_<source_type>_<clean_identifier>.<ext>
+  - Video: greensm_vid_<video_slug>_f<frame_idx:06d>.jpg
+  - Image: greensm_img_<image_slug>.jpg
+- Rules: Lowercase, alphanumeric and underscores only, NO spaces, standard .jpg extension.
+
 Features:
 1. INTRA-VIDEO FASTDEDUP:
    - Generator-based frame streaming (1 FPS sampling for video, EXIF timestamp grouping for image dirs).
@@ -16,13 +22,14 @@ Features:
    - Density tag (Vehicle count > 12).
    - Exports pre-label `.txt` files in YOLO format for CVAT mapped to GreenSM 5-class taxonomy:
      (0: greensm, 1: car, 2: motorcycle, 3: bus, 4: truck).
-   - Outputs aggregated `data_profile.json` (merges incremental runs seamlessly).
+   - Outputs aggregated `data_profile.json`.
 3. AUTOMATIC CVAT PACKAGING:
-   - Automatically packages new survived images & pre-labels into non-duplicating CVAT ZIP files.
+   - Native CVAT XML (CVAT 1.1 format) + Split YOLO batches.
 """
 
 import os
 import sys
+import re
 import json
 import argparse
 from pathlib import Path
@@ -60,6 +67,50 @@ DEFAULT_INPUT_DIR = Path("data/inputs")
 DEFAULT_VIDEO_DIR = DEFAULT_INPUT_DIR / "videos"
 DEFAULT_IMAGE_DIR = DEFAULT_INPUT_DIR / "images"
 DEFAULT_OUTPUT_DIR = Path("data/outputs")
+
+
+def sanitize_slug(name):
+    """
+    Sanitize text to a clean slug:
+    - Lowercase
+    - Replace all non-alphanumeric characters (spaces, hyphens, dots, colons) with underscore
+    - Strip leading and trailing underscores
+    - Collapse multiple underscores into one
+    """
+    clean = re.sub(r'[^a-zA-Z0-9]+', '_', str(name)).strip('_').lower()
+    return clean
+
+
+import hashlib
+import uuid
+
+
+def generate_image_id(identifier_str=None):
+    """Generate 8-character hex string (e.g. 'a4f89c2e')."""
+    if identifier_str:
+        return hashlib.md5(str(identifier_str).encode('utf-8')).hexdigest()[:8]
+    return uuid.uuid4().hex[:8]
+
+
+def generate_video_id(video_name):
+    """Generate 4-character ID for video grouping (e.g. 'v8a1')."""
+    h = hashlib.md5(str(video_name).encode('utf-8')).hexdigest()[:4]
+    return f"v{h[:3]}" if not h[0].isalpha() else h
+
+
+def get_standard_image_name(source_type, source_name, index, original_stem=None):
+    """
+    Standard project-wide naming rule:
+    - Image: img_<random_8_chars>.jpg (e.g. img_a4f89c2e.jpg)
+    - Video: vid_<video_id>_<frame_stt:06d>.jpg (e.g. vid_v8a1_000001.jpg)
+    """
+    if source_type == "vid":
+        vid_code = generate_video_id(source_name)
+        return f"vid_{vid_code}_{index:06d}.jpg"
+    else:
+        key = original_stem if original_stem else f"{source_name}_{index}"
+        img_code = generate_image_id(key)
+        return f"img_{img_code}.jpg"
 
 
 def parse_args():
@@ -148,7 +199,6 @@ def get_exif_timestamp(img_path):
         pil_img = Image.open(img_path)
         exif = pil_img._getexif()
         if exif:
-            # 36867: DateTimeOriginal, 306: DateTime
             for tag_id in (36867, 306):
                 if tag_id in exif:
                     dt_str = exif[tag_id]
@@ -156,14 +206,13 @@ def get_exif_timestamp(img_path):
                     return dt.timestamp()
     except Exception:
         pass
-    # Fallback to file modification time
     return os.path.getmtime(img_path)
 
 
 def video_frame_streamer(video_path):
     """
     Generator streaming 1 frame per second (1 FPS) from a video file to avoid RAM overflow.
-    Yields: dict with keys: 'frame_id', 'timestamp', 'bgr_img', 'name', 'source'
+    Uses standardized naming: greensm_vid_<slug>_f<idx:06d>.jpg (NO SPACES).
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -191,7 +240,7 @@ def video_frame_streamer(video_path):
         if current_frame_idx % frame_interval == 0:
             sampled_count += 1
             sec = current_frame_idx / fps
-            frame_name = f"{video_stem}_frame_{sampled_count:06d}.jpg"
+            frame_name = get_standard_image_name("vid", video_stem, sampled_count)
             yield {
                 "frame_id": current_frame_idx,
                 "timestamp": sec,
@@ -208,7 +257,7 @@ def video_frame_streamer(video_path):
 def image_dir_streamer(img_dir_path):
     """
     Generator streaming images sorted by EXIF timestamp / file mtime.
-    Yields: dict with keys: 'frame_id', 'timestamp', 'bgr_img', 'name', 'source'
+    Uses standardized naming: greensm_img_<slug>.jpg (NO SPACES).
     """
     path_obj = Path(img_dir_path)
     img_files = [
@@ -234,11 +283,14 @@ def image_dir_streamer(img_dir_path):
         if bgr_img is None:
             continue
 
+        # Standardize name: greensm_img_<slug>.jpg
+        std_name = get_standard_image_name("img", path_obj.name, idx, original_stem=img_path.stem)
+
         yield {
             "frame_id": idx,
             "timestamp": ts,
             "bgr_img": bgr_img,
-            "name": img_path.name,
+            "name": std_name,
             "source": path_obj.name
         }
 
@@ -348,10 +400,16 @@ def profile_image(survived_item):
     """
     bgr_img = survived_item["bgr_img"]
 
-    # 1. Day / Night Tag (HSV V-mean < 65)
+    # 1. Day / Night Tag (Robust Multi-criteria)
     hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
-    brightness_v = float(np.mean(hsv[:, :, 2]))
-    is_night = bool(brightness_v < 65.0)
+    v_channel = hsv[:, :, 2]
+    brightness_v = float(np.mean(v_channel))
+    p90_brightness = float(np.percentile(v_channel, 90))
+
+    # A scene is truly night if overall brightness < 50.0,
+    # OR if brightness < 65.0 AND upper ambient light (p90) < 100.0.
+    # (Prevents daytime scenes with dark asphalt road / building shadows from being misclassified as night)
+    is_night = bool((brightness_v < 50.0) or (brightness_v < 65.0 and p90_brightness < 100.0))
 
     # 2. Blur Tag (Laplacian variance < 100)
     if "laplacian_var" in survived_item:
@@ -410,7 +468,7 @@ def profile_image(survived_item):
 def export_pre_labels(survived_item, pre_labels_dir):
     """
     Exports pre-labels in YOLO normalized format (class x_center y_center width height)
-    to <pre_labels_dir>/<image_name>.txt mapped to GreenSM 5-class taxonomy:
+    to <pre_labels_dir>/<standard_image_stem>.txt mapped to GreenSM 5-class taxonomy:
     (0: greensm, 1: car, 2: motorcycle, 3: bus, 4: truck)
     """
     img_name = survived_item["name"]
@@ -452,7 +510,7 @@ def process_single_input(input_path, output_dir, model, args):
     print(f"\n=======================================================")
     print(f" PROCESSING INPUT: {input_path.name}")
     print(f"=======================================================")
-    print(f"=== STAGE 1: DUAL-STREAM FAST DEDUPLICATION (HD Threshold: {args.hd_thresh}) ===")
+    print(f"=== STAGE 1: pHash + Keep-Most-Vehicles (Perceptual Hashing with Object-Density Selection, HD < {args.hd_thresh}) ===")
 
     current_cluster = []
     current_root_hash = None
@@ -505,7 +563,7 @@ def process_single_input(input_path, output_dir, model, args):
     print(f"       - Survived Frames Kept: {len(survived_items)}")
     print(f"       - Deduplication Ratio: {dedup_ratio:.2f}% reduction")
 
-    print(f"\n[INFO] Saving survived images to: {dedup_images_dir}")
+    print(f"\n[INFO] Saving survived images (Standard Naming, NO SPACES) to: {dedup_images_dir}")
     for item in tqdm(survived_items, desc="Saving Survived Images"):
         save_path = dedup_images_dir / item["name"]
         cv2.imwrite(str(save_path), item["bgr_img"])
@@ -561,7 +619,7 @@ def main():
     if not args.no_zip:
         print(f"\n=== AUTOMATIC CVAT PACKAGING ===")
         zip_dir = output_dir / "cvat_uploads"
-        create_cvat_zip_package(output_dir, zip_dir)
+        create_cvat_zip_package(output_dir, zip_dir, force_all=True)
 
 
 if __name__ == "__main__":

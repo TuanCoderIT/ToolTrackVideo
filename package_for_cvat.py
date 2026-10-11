@@ -3,11 +3,11 @@
 CVAT Packaging Tool for GreenSM Vehicle Detection Project
 
 Features:
-- Packages survived images and matching YOLO pre-labels into small, manageable CVAT ZIP files (Default: 50 images per ZIP).
-- Generates BOTH:
-  1. Split Full ZIP batches (Images + Labels, max 50 images per zip to avoid large file limits).
-  2. Ultra-lightweight Annotation-Only ZIP archive (contains ONLY .txt pre-labels, ~100 KB size, instant upload to CVAT).
-- Fully compatible with CVAT 'Upload Annotations -> YOLO 1.1'.
+- Generates CVAT Native XML Annotations (CVAT 1.1 / CVAT for images 1.1 format):
+  1. Master XML (Covers ALL images, size ~180 KB).
+  2. Split Part XMLs (Matches each 50-image Part, size ~60 KB each).
+- Generates Split YOLO 1.1 ZIP archives (Images + Labels, max 50 images per zip).
+- Supports batch splitting for images.
 - Tracks packaged files in `.zipped_manifest.json` so images are never duplicated.
 """
 
@@ -18,6 +18,7 @@ import zipfile
 import argparse
 from pathlib import Path
 from datetime import datetime
+from PIL import Image
 
 DEFAULT_OUTPUT_DIR = Path("data/outputs")
 DEFAULT_ZIP_DIR = DEFAULT_OUTPUT_DIR / "cvat_uploads"
@@ -32,10 +33,18 @@ GREENSM_CLASSES = [
     "truck"         # 4: Trucks
 ]
 
+CLASS_COLORS = {
+    "greensm": "#00FFFF",
+    "car": "#FF0000",
+    "motorcycle": "#00FF00",
+    "bus": "#9C27B0",
+    "truck": "#FF9800"
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Package deduplicated images and pre-labels into manageable CVAT-ready ZIP archives."
+        description="Package deduplicated images and pre-labels into CVAT-ready archives."
     )
     parser.add_argument(
         "--output_dir",
@@ -47,7 +56,7 @@ def parse_args():
         "--zip_dir",
         type=str,
         default=str(DEFAULT_ZIP_DIR),
-        help=f"Directory to save output ZIP archives (Default: {DEFAULT_ZIP_DIR})."
+        help=f"Directory to save output archives (Default: {DEFAULT_ZIP_DIR})."
     )
     parser.add_argument(
         "--batch_size",
@@ -81,8 +90,86 @@ def save_manifest(manifest_path, manifest_data):
         json.dump(manifest_data, f, indent=2, ensure_ascii=False)
 
 
+def create_cvat_xml_annotations(images_list, dedup_images_dir, pre_labels_dir, xml_path):
+    """
+    Generate native CVAT 1.1 / CVAT for images 1.1 XML annotation file.
+    This format is natively supported by CVAT and avoids all path matching issues of YOLO.
+    """
+    xml_lines = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<annotations>',
+        '  <version>1.1</version>',
+        '  <meta>',
+        '    <task>',
+        '      <id>1</id>',
+        '      <name>GreenSM_PreLabels</name>',
+        f'      <size>{len(images_list)}</size>',
+        '      <mode>annotation</mode>',
+        '      <labels>'
+    ]
+
+    for c in GREENSM_CLASSES:
+        color = CLASS_COLORS.get(c, "#FFFFFF")
+        xml_lines.append(f'        <label><name>{c}</name><color>{color}</color></label>')
+
+    xml_lines.extend([
+        '      </labels>',
+        '    </task>',
+        '  </meta>'
+    ])
+
+    total_boxes = 0
+
+    for idx, img_file in enumerate(images_list):
+        img_name = img_file.name
+        img_path = dedup_images_dir / img_name
+
+        try:
+            with Image.open(img_path) as im:
+                w, h = im.size
+        except Exception:
+            w, h = 1920, 1080
+
+        xml_lines.append(f'  <image id="{idx}" name="{img_name}" width="{w}" height="{h}">')
+
+        txt_name = f"{img_file.stem}.txt"
+        txt_path = pre_labels_dir / txt_name
+
+        if txt_path.exists():
+            with open(txt_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        try:
+                            cls_id = int(parts[0])
+                            xc, yc, bw, bh = map(float, parts[1:5])
+                            label_name = GREENSM_CLASSES[cls_id] if cls_id < len(GREENSM_CLASSES) else "car"
+
+                            xtl = max(0.0, (xc - bw / 2.0) * w)
+                            ytl = max(0.0, (yc - bh / 2.0) * h)
+                            xbr = min(float(w), (xc + bw / 2.0) * w)
+                            ybr = min(float(h), (yc + bh / 2.0) * h)
+
+                            xml_lines.append(
+                                f'    <box label="{label_name}" occluded="0" xtl="{xtl:.2f}" ytl="{ytl:.2f}" '
+                                f'xbr="{xbr:.2f}" ybr="{ybr:.2f}" z_order="0">\n    </box>'
+                            )
+                            total_boxes += 1
+                        except Exception:
+                            continue
+
+        xml_lines.append('  </image>')
+
+    xml_lines.append('</annotations>')
+
+    with open(xml_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(xml_lines))
+
+    return total_boxes
+
+
 def create_single_zip_batch(zip_path, images_chunk, pre_labels_dir, include_images=True):
-    """Helper to create a single zip file with given images and pre-label text files."""
+    """Helper to create a single YOLO 1.1 zip file with exact filename matching."""
     obj_names_content = "\n".join(GREENSM_CLASSES) + "\n"
     obj_data_content = (
         f"classes = {len(GREENSM_CLASSES)}\n"
@@ -94,7 +181,6 @@ def create_single_zip_batch(zip_path, images_chunk, pre_labels_dir, include_imag
     train_txt_lines = []
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        # Standard Metadata Files
         zf.writestr("obj.names", obj_names_content)
         zf.writestr("obj.data", obj_data_content)
 
@@ -103,22 +189,19 @@ def create_single_zip_batch(zip_path, images_chunk, pre_labels_dir, include_imag
             img_name = img_file.name
             txt_name = f"{stem}.txt"
 
-            train_txt_lines.append(f"data/obj_train_data/{img_name}\n")
+            train_txt_lines.append(f"{img_name}\n")
+            train_txt_lines.append(f"obj_train_data/{img_name}\n")
 
-            # Write images if requested
             if include_images and img_file.exists():
-                zf.write(img_file, arcname=f"data/obj_train_data/{img_name}")
                 zf.write(img_file, arcname=f"obj_train_data/{img_name}")
                 zf.write(img_file, arcname=img_name)
 
-            # Write label file (.txt)
             txt_file = pre_labels_dir / txt_name
             if txt_file.exists():
                 txt_data = txt_file.read_bytes()
             else:
                 txt_data = b""
 
-            zf.writestr(f"data/obj_train_data/{txt_name}", txt_data)
             zf.writestr(f"obj_train_data/{txt_name}", txt_data)
             zf.writestr(txt_name, txt_data)
 
@@ -158,53 +241,62 @@ def create_cvat_zip_package(output_dir, zip_dir, batch_size=50, force_all=False)
         return None
 
     print(f"[INFO] Found {len(new_images)} NEW un-packaged image(s) out of {len(all_images)} total.")
-    print(f"[INFO] Batch size limit: {batch_size} images per ZIP file.")
-
     zip_dir.mkdir(parents=True, exist_ok=True)
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Split into chunks of batch_size
+    # 1. MASTER CVAT NATIVE XML (ALL IMAGES)
+    master_xml_filename = f"cvat_annotations_ALL_{timestamp_str}.xml"
+    master_xml_path = zip_dir / master_xml_filename
+    master_xml_zip_filename = f"cvat_NATIVE_XML_ALL_{timestamp_str}.zip"
+    master_xml_zip_path = zip_dir / master_xml_zip_filename
+
+    total_boxes = create_cvat_xml_annotations(new_images, dedup_images_dir, pre_labels_dir, master_xml_path)
+    with zipfile.ZipFile(master_xml_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(master_xml_path, arcname="annotations.xml")
+
+    # 2. SPLIT CHUNKS (IMAGES + XML PER PART)
     chunks = [new_images[i:i + batch_size] for i in range(0, len(new_images), batch_size)]
     total_chunks = len(chunks)
-
-    created_zip_paths = []
     packaged_names = []
 
-    print(f"\n=== GENERATING {total_chunks} SPLIT ZIP BATCH(ES) ===")
+    print(f"\n=== GENERATING {total_chunks} SPLIT BATCHES ({batch_size} IMAGES/PART) ===")
     for idx, chunk in enumerate(chunks, start=1):
+        # Part Image + YOLO zip
         zip_filename = f"cvat_batch_{timestamp_str}_part{idx:02d}_of_{total_chunks:02d}.zip"
         zip_path = zip_dir / zip_filename
-
-        print(f"[INFO] Packaging Part [{idx}/{total_chunks}] ({len(chunk)} images): {zip_filename}")
         create_single_zip_batch(zip_path, chunk, pre_labels_dir, include_images=True)
-        created_zip_paths.append(zip_path)
+
+        # Part XML zip (Matches ONLY this part)
+        part_xml_filename = f"cvat_NATIVE_XML_part{idx:02d}_of_{total_chunks:02d}.xml"
+        part_xml_path = zip_dir / part_xml_filename
+        part_xml_zip_path = zip_dir / f"cvat_NATIVE_XML_part{idx:02d}_of_{total_chunks:02d}.zip"
+        
+        create_cvat_xml_annotations(chunk, dedup_images_dir, pre_labels_dir, part_xml_path)
+        with zipfile.ZipFile(part_xml_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(part_xml_path, arcname="annotations.xml")
+
+        print(f"[INFO] Part [{idx}/{total_chunks}] ({len(chunk)} images):")
+        print(f"       - Image ZIP: {zip_filename}")
+        print(f"       - Native XML ZIP: {part_xml_zip_path.name}")
 
         for img in chunk:
             packaged_names.append(img.name)
-
-    # ALSO GENERATE ANNOTATION-ONLY ZIP (SUPER LIGHTWEIGHT, NO IMAGES)
-    anno_only_filename = f"cvat_ANNOTATIONS_ONLY_{timestamp_str}.zip"
-    anno_only_path = zip_dir / anno_only_filename
-    print(f"\n[INFO] Packaging LIGHTWEIGHT Annotations-Only ZIP (~100 KB): {anno_only_filename}")
-    create_single_zip_batch(anno_only_path, new_images, pre_labels_dir, include_images=False)
-    created_zip_paths.append(anno_only_path)
 
     # Update manifest
     manifest["zipped_files"].extend(packaged_names)
     manifest["batches"].append({
         "timestamp": datetime.now().isoformat(),
         "image_count": len(packaged_names),
-        "split_parts": total_chunks,
-        "annotation_only_file": anno_only_filename
+        "total_boxes": total_boxes,
+        "master_xml": master_xml_zip_filename
     })
     save_manifest(manifest_path, manifest)
 
-    print(f"\n[SUCCESS] CVAT Packages created successfully!")
-    print(f"          Output Folder: {zip_dir}")
-    print(f"          - Created {total_chunks} split batch ZIP(s) (Images + Labels, {batch_size} img/zip)")
-    print(f"          - Created 1 Annotations-Only ZIP ({anno_only_filename} - Super Fast Upload!)")
-
-    return created_zip_paths
+    print(f"\n[SUCCESS] Packaging Completed!")
+    print(f"  ⭐ Dùng file XML này nếu Task chứa TOÀN BỘ 150 ảnh: {master_xml_zip_path.name}")
+    print(f"  ⭐ Dùng file XML part tương ứng nếu bạn tạo Task theo từng Part:")
+    for idx in range(1, total_chunks + 1):
+        print(f"     - Task Part {idx}: cvat_NATIVE_XML_part{idx:02d}_of_{total_chunks:02d}.zip")
 
 
 def main():

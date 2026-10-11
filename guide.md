@@ -1,106 +1,91 @@
-# HƯỚNG DẪN SỬ DỤNG PIPELINE (STAGE 1 & STAGE 2)
-**GreenSM Vehicle Detection Project**
+# HƯỚNG DẪN SỬ DỤNG PIPELINE & QUY CHUẨN ĐẶT TÊN DỮ LIỆU
+**GreenSM Vehicle Detection Project (Active HITL Lab)**
 
-Tài liệu này hướng dẫn chi tiết cách đưa dữ liệu đầu vào, chạy tự động pipeline lọc trùng frame (**Intra-Video FastDedup**) & tạo metadata + nhãn mồi (**Automated Data Profiling**), và nén file ZIP tự động upload lên CVAT.
+Tài liệu này chuẩn hóa quy tắc đặt tên file ngắn gọn, phục vụ trực tiếp cho việc **chia tập Test Set chống rò rỉ dữ liệu (Anti-Leakage Group Split)** và vận hành pipeline CVAT.
 
 ---
 
-## 📁 1. CẤU TRÚC THƯ MỤC DỮ LIỆU
+## 🏷️ 1. QUY CHUẨN ĐẶT TÊN FILE CHUẨN DỰ ÁN (NEW NAMING CONVENTION)
 
-Hệ thống đã được thiết lập sẵn cấu trúc thư mục mặc định bên dưới:
+Hệ thống tự động đặt tên theo 2 định dạng ngắn gọn, chuẩn hóa, **hoàn toàn không có dấu cách**:
+
+### 🔹 Dạng 1: Ảnh trích xuất từ Video (`videos/`)
+```text
+vid_<random_id_video>_<frame_stt>.jpg
+```
+- **`<random_id_video>`**: Mã định danh 4 ký tự duy nhất đại diện cho từng video (ví dụ `v8a1`, `v509`).
+- **`<frame_stt>`**: Số thứ tự frame theo thời gian 6 chữ số (`000001`, `000002`...).
+- **Ý nghĩa**: Toàn bộ frame trích xuất từ cùng một video sẽ mang cùng một mã `vid_<id>`. Khi chia tập dữ liệu ở Bước 3, chỉ cần lọc theo mã `vid_<id>` là có thể **bốc nguyên cả cụm video vào Fixed Test Set hoặc Train Set**, chống tuyệt đối hiện tượng rò rỉ không gian - thời gian (Data Leakage).
+- **Ví dụ**:
+  - Video A: `vid_v8a1_000001.jpg`, `vid_v8a1_000002.jpg`...
+  - Video B: `vid_v509_000001.jpg`, `vid_v509_000002.jpg`...
+
+---
+
+### 🔹 Dạng 2: Ảnh từ thư mục ảnh rời (`images/`)
+```text
+img_<random_8_ky_tu>.jpg
+```
+- **`<random_8_ky_tu>`**: Mã băm ngẫu nhiên 8 ký tự hex (ví dụ `a4f89c2e`, `7b21d90f`).
+- **Ý nghĩa**: Tên file cực kỳ ngắn gọn, không dấu cách, không ký tự đặc biệt, đảm bảo tính duy nhất và bảo mật.
+- **Ví dụ**:
+  - `img_a4f89c2e.jpg`
+  - `img_7b21d90f.jpg`
+
+---
+
+## 📁 2. CẤU TRÚC THƯ MỤC DỰ ÁN
 
 ```text
 ToolTrackVideo/
 ├── data/
 │   ├── inputs/
-│   │   ├── videos/   <-- THẢ CÁC FILE VIDEO (.mp4, .avi, .mov,...) VÀO ĐÂY (CÓ THỂ CHỨA NHIỀU VIDEO)
-│   │   └── images/   <-- HOẶC THẢ THƯ MỤC / CÁC FILE ẢNH THÔ VÀO ĐÂY
-│   └── outputs/      <-- KẾT QUẢ SẼ TỰ ĐỘNG XUẤT RA ĐÂY
-│       ├── deduplicated_images/  (Ảnh đã lọc trùng)
-│       ├── pre_labels/           (Nhãn mồi chuẩn YOLO .txt để upload CVAT)
-│       ├── cvat_uploads/         (File ZIP đã đóng gói sẵn sàng upload lên CVAT)
-│       └── data_profile.json     (File metadata profiling chi tiết)
+│   │   ├── videos/   <-- Thả file video (.mp4, .avi,...) vào đây
+│   │   └── images/   <-- Thả file ảnh thô vào đây
+│   └── outputs/
+│       ├── deduplicated_images/  (Ảnh đã lọc trùng, đặt tên theo chuẩn img_... / vid_...)
+│       ├── pre_labels/           (Nhãn mồi YOLO .txt khớp 100% tên ảnh)
+│       ├── cvat_uploads/         (File nén CVAT chia theo Part và Native XML)
+│       └── data_profile.json     (Metadata profiling chi tiết: night, blur, small, occlusion, density)
 ├── fast_dedup_profiling.py       (Script chạy chính)
-├── package_for_cvat.py           (Công cụ đóng gói ZIP CVAT chống trùng)
+├── package_for_cvat.py           (Công cụ đóng gói ZIP CVAT)
 └── guide.md
 ```
 
 ---
 
-## 🚀 2. CHẠY PIPELINE (ĐƠN GIẢN NHẤT)
+## 🚀 3. THUẬT TOÁN ĐANG CHẠY TRONG PIPELINE
 
-### Bước 1: Thả dữ liệu vào thư mục
-- **Nếu chạy cho Video**: Đặt file video của bạn (có thể thả nhiều video cùng lúc như `video1.mp4`, `video2.mp4`) vào thư mục `data/inputs/videos/`.
-- **Nếu chạy cho Thư mục ảnh**: Thả các file ảnh thô (`.jpg`, `.png`,...) vào thư mục `data/inputs/images/`.
+Hệ thống đang chạy **chính xác 100%** giải pháp được đề xuất:
+**`Proposed: pHash + Keep-Most-Vehicles (HD < 5) — Perceptual Hashing with Object-Density Selection`**
 
-### Bước 2: Chạy duy nhất 1 lệnh Terminal
-Mở terminal tại thư mục dự án `ToolTrackVideo` và chạy:
+1. **Giai đoạn 1 — pHash Clustering (Lọc tinh)**:
+   - Dùng Perceptual Hashing (pHash) tính mã băm 64-bit cho từng frame.
+   - So sánh trượt với ngưỡng Hamming Distance $HD < 5$ (`--hd_thresh 5`) để gom nhóm các frame trùng bối cảnh / góc quay tĩnh.
+2. **Giai đoạn 2 — Object-Density Selection (Keep-Most-Vehicles)**:
+   - Trong mỗi cụm trùng nhau ($HD < 5$), chạy mô hình **YOLO11n COCO** đếm tổng số phương tiện (`car`, `motorcycle`, `bus`, `truck`).
+   - Ưu tiên chọn giữ lại **01 frame duy nhất có mật độ phương tiện cao nhất** (`max vehicle count`), loại bỏ các frame trùng còn lại.
+   - Nếu hòa số xe, ưu tiên frame có độ sắc nét (Laplacian variance) cao hơn.
+3. **Giai đoạn 3 — Zero-Cost Re-use**:
+   - Tái sử dụng luôn kết quả inference của YOLO11n từ bước chọn lọc trên để làm Data Profiling và sinh file nhãn mồi `.txt` cho CVAT (không chạy lại YOLO lần 2).
+
+Mở Terminal tại thư mục `ToolTrackVideo` và chạy:
 
 ```bash
 python fast_dedup_profiling.py
 ```
 
-> **Hệ thống tự động xử lý và bảo vệ dữ liệu:**
-> 1. **Tự động gắn Tiền tố tên video (Prefix)**: Ví dụ file `video1.mp4` sẽ sinh ảnh `video1_frame_000001.jpg`, `video2.mp4` sẽ sinh `video2_frame_000001.jpg`. Do đó khi tải video mới vào chạy tiếp **KHÔNG BAO GIỜ BỊ GHI ĐÈ** ảnh cũ.
-> 2. **Tự động cộng dồn Profile (JSON Merge)**: Cập nhật thông tin các ảnh mới vào file `data_profile.json` mà không xóa metadata của các lượt chạy trước.
-> 3. **Tự động quét nhiều Video**: Nếu trong `data/inputs/videos/` có 5 video, script sẽ tự động duyệt chạy lần lượt cả 5 video.
-> 4. **Tự động đóng gói ZIP CVAT**: Tạo file ZIP tại `data/outputs/cvat_uploads/` theo định dạng YOLO 1.1 sẵn sàng import vào CVAT, tự động lọc bỏ các ảnh đã đóng gói trước đó để tránh trùng lặp.
+> Nếu máy có GPU NVIDIA, thêm `--device 0` để tăng tốc độ xử lý:
+> ```bash
+> python fast_dedup_profiling.py --device 0
+> ```
 
 ---
 
-## 📦 3. ĐÓNG GÓI THỦ CÔNG LÊN CVAT (NẾU CẦN)
+## 📤 4. UPLOAD LÊN CVAT (NHẬN 100% NHÃN MỒI)
 
-Nếu bạn chỉ muốn đóng gói các ảnh mới vừa lọc trùng chưa được nén lên CVAT:
-
-```bash
-python package_for_cvat.py
-```
-
----
-
-## ⚙️ 4. TÙY CHỌN NÂNG CAO (DÀNH CHO ADVANCED USER)
-
-Nếu bạn muốn chỉ định đường dẫn dữ liệu cụ thể hoặc điều chỉnh thông số lọc, bạn có thể truyền các đối số CLI:
-
-```bash
-python fast_dedup_profiling.py --input /duong/dan/tuy/y/video.mp4 --output_dir ./my_output --hd_thresh 5
-```
-
-### Bảng tham số:
-| Tham số | Mặc định | Ý nghĩa |
-| :--- | :--- | :--- |
-| `--input` | *Tự động quét* | Đường dẫn đến file Video HOẶC Thư mục chứa ảnh. |
-| `--output_dir` | `data/outputs` | Thư mục lưu kết quả. |
-| `--hd_thresh` | `5` | Ngưỡng Hamming Distance lọc trùng pHash (giá trị nhỏ hơn = lọc khắt khe hơn). |
-| `--model_path` | `yolo11n.pt` | Mô hình YOLO đếm phương tiện. |
-| `--conf` | `0.25` | Ngưỡng confidence YOLO. |
-| `--device` | *Tự chọn* | `cuda` (nếu có GPU) hoặc `cpu`. |
-| `--no_zip` | `False` | Tắt tự động nén ZIP CVAT ở cuối pipeline. |
-
----
-
-## 📊 5. KẾT QUẢ ĐẦU RA (OUTPUT)
-
-Sau khi chạy xong, trong thư mục `data/outputs/` sẽ xuất hiện:
-
-1. **`deduplicated_images/`**: Chứa danh sách ảnh "sống sót" (đã loại bỏ ảnh trùng lặp và giữ lại frame có nhiều xe nhất).
-2. **`pre_labels/`**: Các file `.txt` tương ứng với mỗi ảnh sống sót theo chuẩn 5 classes GreenSM (`0: greensm, 1: car, 2: motorcycle, 3: bus, 4: truck`).
-3. **`cvat_uploads/`**: Chứa các file ZIP đóng gói theo định dạng YOLO 1.1 (`cvat_batch_YYYYMMDD_HHMMSS.zip`) sẵn sàng upload CVAT.
-4. **`data_profile.json`**: File chứa thông tin phân tích chất lượng ảnh chuyên sâu (được cộng dồn tự động):
-   ```json
-   {
-     "route01_frame_000001.jpg": {
-       "source": "route01.mp4",
-       "vehicle_count": 15,
-       "brightness_v": 52.4,
-       "laplacian_var": 142.1,
-       "tags": {
-         "is_night": true,
-         "is_blur": false,
-         "has_small_object": true,
-         "has_high_occlusion": true,
-         "is_dense_scene": true
-       }
-     }
-   }
-   ```
+1. Mở Task trên CVAT.
+2. Vào **Actions** ➜ **Upload annotations** ➜ Chọn định dạng: **`CVAT 1.1`** (hoặc **`CVAT for images 1.1`**).
+3. Tải file ZIP Native XML từ thư mục `data/outputs/cvat_uploads/`:
+   - Nếu Task chứa toàn bộ ảnh: tải file `cvat_NATIVE_XML_ALL_...zip`.
+   - Nếu Task chia theo từng Part: tải file `cvat_NATIVE_XML_part01_...zip`.
