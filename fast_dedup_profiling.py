@@ -14,8 +14,11 @@ Features:
    - Scale variance (Small vehicle ratio < 1%).
    - High Occlusion (Intersection over Area - IoA > 30%).
    - Density tag (Vehicle count > 12).
-   - Exports pre-label `.txt` files in YOLO format for CVAT.
+   - Exports pre-label `.txt` files in YOLO format for CVAT mapped to GreenSM 5-class taxonomy:
+     (0: greensm, 1: car, 2: motorcycle, 3: bus, 4: truck).
    - Outputs aggregated `data_profile.json` (merges incremental runs seamlessly).
+3. AUTOMATIC CVAT PACKAGING:
+   - Automatically packages new survived images & pre-labels into non-duplicating CVAT ZIP files.
 """
 
 import os
@@ -31,9 +34,25 @@ import imagehash
 from tqdm import tqdm
 from ultralytics import YOLO
 
+from package_for_cvat import create_cvat_zip_package
+
 # Target vehicle class IDs in COCO dataset
 # 2: car, 3: motorcycle, 5: bus, 7: truck
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}
+
+# Mapping from COCO vehicle IDs to GreenSM 5-class taxonomy:
+# 0: greensm (reserved for CVAT human review)
+# 1: car (from COCO 2)
+# 2: motorcycle (from COCO 3)
+# 3: bus (from COCO 5)
+# 4: truck (from COCO 7)
+COCO_TO_GREENSM_MAP = {
+    2: 1,  # car -> 1
+    3: 2,  # motorcycle -> 2
+    5: 3,  # bus -> 3
+    7: 4   # truck -> 4
+}
+
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm'}
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff', '.tif'}
 
@@ -82,6 +101,11 @@ def parse_args():
         type=str,
         default="",
         help="Device for YOLO inference (e.g., 'cpu', 'cuda', '0'). Default auto-detect."
+    )
+    parser.add_argument(
+        "--no_zip",
+        action="store_true",
+        help="Skip auto-creation of CVAT ZIP package at the end of pipeline."
     )
     return parser.parse_args()
 
@@ -167,7 +191,6 @@ def video_frame_streamer(video_path):
         if current_frame_idx % frame_interval == 0:
             sampled_count += 1
             sec = current_frame_idx / fps
-            # Prefixed with video stem to prevent overwrites across different videos
             frame_name = f"{video_stem}_frame_{sampled_count:06d}.jpg"
             yield {
                 "frame_id": current_frame_idx,
@@ -252,9 +275,7 @@ def run_yolo_on_frame(model, frame_item, conf_thresh, device):
             
             # Filter for vehicle classes
             if cls_id in VEHICLE_CLASS_IDS:
-                # xywh normalized: [x_center, y_center, width, height] normalized to 0-1
                 xywhn = box.xywhn[0].cpu().numpy().tolist()
-                # xyxy pixel: [x1, y1, x2, y2]
                 xyxy = box.xyxy[0].cpu().numpy().tolist()
                 
                 detections.append({
@@ -284,7 +305,6 @@ def resolve_cluster_keep_most_vehicles(cluster_items, model, conf_thresh, device
 
         vehicle_count = len(item["detections"])
         
-        # Calculate sharpness (Laplacian variance) for tie-breaking
         gray = cv2.cvtColor(item["bgr_img"], cv2.COLOR_BGR2GRAY)
         sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
         item["laplacian_var"] = sharpness
@@ -390,7 +410,8 @@ def profile_image(survived_item):
 def export_pre_labels(survived_item, pre_labels_dir):
     """
     Exports pre-labels in YOLO normalized format (class x_center y_center width height)
-    to <pre_labels_dir>/<image_name>.txt
+    to <pre_labels_dir>/<image_name>.txt mapped to GreenSM 5-class taxonomy:
+    (0: greensm, 1: car, 2: motorcycle, 3: bus, 4: truck)
     """
     img_name = survived_item["name"]
     stem = Path(img_name).stem
@@ -398,9 +419,10 @@ def export_pre_labels(survived_item, pre_labels_dir):
 
     lines = []
     for det in survived_item.get("detections", []):
-        cls_id = det["cls"]
+        coco_cls = det["cls"]
+        target_cls = COCO_TO_GREENSM_MAP.get(coco_cls, coco_cls)
         x_c, y_c, w, h = det["bbox_xywhn"]
-        lines.append(f"{cls_id} {x_c:.6f} {y_c:.6f} {w:.6f} {h:.6f}\n")
+        lines.append(f"{target_cls} {x_c:.6f} {y_c:.6f} {w:.6f} {h:.6f}\n")
 
     with open(txt_path, "w", encoding="utf-8") as f:
         f.writelines(lines)
@@ -490,7 +512,6 @@ def process_single_input(input_path, output_dir, model, args):
 
     print(f"\n=== STAGE 2: AUTOMATED DATA PROFILING (Using Cached YOLO Inference) ===")
 
-    # Load existing data profile JSON if it exists to merge profiles seamlessly
     existing_profile = {}
     if data_profile_json.exists():
         try:
@@ -534,8 +555,13 @@ def main():
         print(f"\n>>> Running [{idx}/{len(inputs)}]: {input_item}")
         process_single_input(input_item, output_dir, model, args)
 
-    print(f"\n[SUCCESS] All inputs processed cleanly!")
-    print(f"          Outputs directory: {output_dir}")
+    print(f"\n[SUCCESS] Pipeline execution finished cleanly!")
+
+    # Auto-package for CVAT unless --no_zip is set
+    if not args.no_zip:
+        print(f"\n=== AUTOMATIC CVAT PACKAGING ===")
+        zip_dir = output_dir / "cvat_uploads"
+        create_cvat_zip_package(output_dir, zip_dir)
 
 
 if __name__ == "__main__":
