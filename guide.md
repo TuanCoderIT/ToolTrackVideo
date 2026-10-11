@@ -13,12 +13,12 @@ Toàn bộ hệ thống được chia thành các module độc lập theo nguy�
 ToolTrackVideo/
 ├── src/
 │   ├── __init__.py
-│   ├── config.py           # 1. Quản lý Taxonomy 5 class, các ngưỡng pHash, HSV, IoA
+│   ├── config.py           # 1. Quản lý Taxonomy 7 class CVAT, các ngưỡng pHash, HSV, IoA
 │   ├── utils.py            # 2. Tiện ích đặt tên chuẩn (vid_/img_), tính IoA
 │   ├── streamers.py        # 3. Đọc dữ liệu dạng Generator (1 FPS Video, EXIF ảnh)
 │   ├── dedup.py            # 4. GIAI ĐOẠN 1: pHash + Keep-Most-Vehicles (Object-Density Selection)
-│   ├── profiling.py        # 5. GIAI ĐOẠN 2: Trích xuất Metadata (HSV, Blur, Small, Occlusion) & Pre-label
-│   └── cvat_packager.py    # 6. Đóng gói CVAT (Native XML + Split ZIP batches)
+│   ├── profiling.py        # 5. GIAI ĐOẠN 2: Trích xuất Metadata & Pre-label (trừ greensm để gán tay)
+│   └── cvat_packager.py    # 6. Đóng gói CVAT (Native XML 7-class + Split ZIP batches)
 ├── run_pipeline.py         # File CLI điều phối chính (Orchestrator)
 ├── fast_dedup_profiling.py # Wrapper tương thích ngược (trỏ vào run_pipeline.py)
 ├── package_for_cvat.py     # Wrapper tương thích ngược (trỏ vào src.cvat_packager)
@@ -57,11 +57,12 @@ Hệ thống đang chạy **chính xác 100%** giải pháp được đề xuấ
    - Tính Perceptual Hash (pHash) 64-bit cho từng frame.
    - So sánh trượt với ngưỡng Hamming Distance $HD < 5$ (`--hd_thresh 5`) để gom nhóm các frame trùng bối cảnh / góc quay tĩnh.
 2. **Giai đoạn 2 — Object-Density Selection (Keep-Most-Vehicles)** (`src/dedup.py`):
-   - Trong mỗi cụm trùng nhau ($HD < 5$), chạy mô hình **YOLO11n COCO** đếm tổng số phương tiện (`car`, `motorcycle`, `bus`, `truck`).
-   - Ưu tiên chọn giữ lại **01 frame duy nhất có mật độ phương tiện cao nhất** (`max vehicle count`), loại bỏ các frame trùng còn lại.
+   - Trong mỗi cụm trùng nhau ($HD < 5$), chạy mô hình **YOLO11n COCO** đếm tổng số đối tượng giao thông (`person`, `bike`, `car`, `motorcycle`, `bus`, `truck`).
+   - Ưu tiên chọn giữ lại **01 frame duy nhất có mật độ đối tượng cao nhất** (`max vehicle count`), loại bỏ các frame trùng còn lại.
    - Nếu hòa số xe, ưu tiên frame có độ sắc nét (Laplacian variance) cao hơn.
 3. **Giai đoạn 3 — Automated Profiling & Pre-labeling** (`src/profiling.py`):
    - Tái sử dụng luôn kết quả inference của YOLO11n từ bước chọn lọc trên để làm Data Profiling và sinh file nhãn mồi `.txt` cho CVAT (không chạy lại YOLO lần 2).
+   - **Cơ chế Pre-labeling**: Tự động gán nhãn cho 6 lớp (`car`, `motorcycle`, `bike`, `person`, `bus`, `truck`). Riêng nhãn `greensm` được giữ nguyên để annotator gán nhãn thủ công trên CVAT.
 
 ---
 

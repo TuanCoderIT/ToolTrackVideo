@@ -10,6 +10,7 @@ import numpy as np
 from tqdm import tqdm
 
 from .config import (
+    GREENSM_CLASSES,
     COCO_TO_GREENSM_MAP,
     NIGHT_V_THRESH,
     NIGHT_P90_THRESH,
@@ -79,9 +80,19 @@ def profile_image(survived_item):
     # 5. Density Tag (vehicle_count > 12)
     is_dense_scene = bool(vehicle_count > DENSE_SCENE_COUNT)
 
+    # Class breakdown
+    class_breakdown = {}
+    for det in detections:
+        c_id = det["cls"]
+        if c_id in COCO_TO_GREENSM_MAP:
+            t_id = COCO_TO_GREENSM_MAP[c_id]
+            t_name = GREENSM_CLASSES[t_id]
+            class_breakdown[t_name] = class_breakdown.get(t_name, 0) + 1
+
     profile = {
         "source": survived_item["source"],
         "vehicle_count": vehicle_count,
+        "class_breakdown": class_breakdown,
         "brightness_v": round(brightness_v, 2),
         "laplacian_var": round(laplacian_var, 2),
         "tags": {
@@ -99,8 +110,9 @@ def profile_image(survived_item):
 def export_pre_labels(survived_item, pre_labels_dir):
     """
     Exports pre-labels in YOLO normalized format (class x_center y_center width height)
-    to <pre_labels_dir>/<standard_image_stem>.txt mapped to GreenSM 5-class taxonomy:
-    (0: greensm, 1: car, 2: motorcycle, 3: bus, 4: truck)
+    to <pre_labels_dir>/<standard_image_stem>.txt mapped to GreenSM 7-class taxonomy:
+    (0: greensm [MANUAL], 1: car, 2: motorcycle, 3: bike, 4: person, 5: bus, 6: truck).
+    NOTE: 'greensm' (0) is NEVER pre-labeled; human annotators label it manually on CVAT.
     """
     img_name = survived_item["name"]
     stem = Path(img_name).stem
@@ -109,7 +121,12 @@ def export_pre_labels(survived_item, pre_labels_dir):
     lines = []
     for det in survived_item.get("detections", []):
         coco_cls = det["cls"]
-        target_cls = COCO_TO_GREENSM_MAP.get(coco_cls, coco_cls)
+        if coco_cls not in COCO_TO_GREENSM_MAP:
+            continue
+        target_cls = COCO_TO_GREENSM_MAP[coco_cls]
+        # Safety assertion: never export class 0 (greensm) in automated pre-labels
+        if target_cls == 0:
+            continue
         x_c, y_c, w, h = det["bbox_xywhn"]
         lines.append(f"{target_cls} {x_c:.6f} {y_c:.6f} {w:.6f} {h:.6f}\n")
 

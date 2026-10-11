@@ -41,7 +41,7 @@ def run_yolo_on_frame(model, frame_item, conf_thresh=DEFAULT_CONF_THRESH, device
             cls_id = int(box.cls[0].item())
             conf = float(box.conf[0].item())
 
-            # Filter for COCO vehicle classes: car(2), motorcycle(3), bus(5), truck(7)
+            # Filter for target classes: person(0), bike/bicycle(1), car(2), motorcycle(3), bus(5), truck(7)
             if cls_id in COCO_VEHICLE_CLASS_IDS:
                 xywhn = box.xywhn[0].cpu().numpy().tolist()
                 xyxy = box.xyxy[0].cpu().numpy().tolist()
